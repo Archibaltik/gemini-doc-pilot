@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import time
@@ -5,6 +6,7 @@ import tempfile
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from docx import Document
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
@@ -57,7 +59,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("💡 При ошибке лимитов (429) используйте `gemini-3.5-flash-lite` без веб-поиска.")
 
-# --- Безопасный CSS только для наших кастомных Bento-карточек (не трогает виджеты Streamlit) ---
+# --- Безопасный CSS для Bento-карточек ---
 st.markdown("""
 <style>
     .kpi-card {
@@ -128,13 +130,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Заголовок и вкладки ---
+# --- Заголовок и вкладки (добавлена вкладка Сравнения) ---
 st.title("🌿 Doc & Market AI Platform")
-st.caption("Интеллектуальный анализ документов, расчеты и визуальная аналитика")
+st.caption("Интеллектуальный анализ документов, сравнение отчетов, расчеты и экспорт в Word / Excel")
 
-tab_agent, tab_dashboard, tab_guide = st.tabs([
+tab_agent, tab_dashboard, tab_compare, tab_guide = st.tabs([
     "🛠️ Агент (Вопросы и Расчеты)",
     "📊 Дашборд (KPI и Диаграммы)",
+    "⚖️ Сравнение 2 отчетов",
     "📖 Гайд и Ссылки"
 ])
 
@@ -153,7 +156,7 @@ def calculate_ratio(part: float, total: float) -> str:
     ratio = (part / total) * 100
     return f"Доля: {ratio:.2f}% ({part} от {total})"
 
-# --- Pydantic-схема ---
+# --- Pydantic-схема для Дашборда ---
 class KPICard(BaseModel):
     label: str = Field(description="Название показателя (например, Выручка)")
     value: str = Field(description="Значение с единицами (например, 1.5 трлн ₽)")
@@ -176,13 +179,92 @@ class ExecutiveSummary(BaseModel):
     period: str = Field(description="Период отчета")
     ai_smart_insight: str = Field(description="Самый главный, концентрированный инсайт по всему документу (2-3 предложения)")
     key_metrics_cards: list[KPICard] = Field(description="Ровно 4 главные метрики для верхних KPI-карточек")
-    structure_breakdown: list[BreakdownItem] = Field(description="4-6 категорий для кольцевой диаграммы (структура выручки, активов или расходов)")
-    breakdown_title: str = Field(description="Заголовок для кольцевой диаграммы (например, Структура выручки по сегментам)")
+    structure_breakdown: list[BreakdownItem] = Field(description="4-6 категорий для кольцевой диаграммы")
+    breakdown_title: str = Field(description="Заголовок для кольцевой диаграммы")
     chart_series: list[MetricSeries] = Field(description="1-2 показателя с историческими точками для графиков динамики")
     strategic_findings: list[str] = Field(description="4-5 ключевых стратегических выводов")
     marketing_and_clients: list[str] = Field(description="3-4 вывода по маркетингу и клиентам")
     tech_and_ai: list[str] = Field(description="3-4 вывода по IT и AI")
     growth_hypotheses: list[str] = Field(description="3 конкретные гипотезы по развитию бизнеса")
+
+# --- Генераторы файлов Word (.docx) и Excel (.xlsx) ---
+def build_docx_report(data: ExecutiveSummary) -> bytes:
+    doc = Document()
+    doc.add_heading(f"Аналитический отчет: {data.company_name} ({data.period})", level=0)
+
+    p_insight = doc.add_paragraph()
+    p_insight.add_run("AI Smart Insight: ").bold = True
+    p_insight.add_run(data.ai_smart_insight)
+
+    doc.add_heading("1. Ключевые показатели (KPI)", level=1)
+    if data.key_metrics_cards:
+        table = doc.add_table(rows=1, cols=3)
+        table.style = "Table Grid"
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = "Показатель"
+        hdr_cells[1].text = "Значение"
+        hdr_cells[2].text = "Динамика"
+        for c in data.key_metrics_cards:
+            row_cells = table.add_row().cells
+            row_cells[0].text = c.label
+            row_cells[1].text = c.value
+            row_cells[2].text = c.delta or "-"
+
+    sections = [
+        ("2. Стратегические выводы", data.strategic_findings),
+        ("3. Маркетинг и клиенты", data.marketing_and_clients),
+        ("4. Технологии и AI", data.tech_and_ai),
+        ("5. Гипотезы роста", data.growth_hypotheses),
+    ]
+    for title, items in sections:
+        doc.add_heading(title, level=1)
+        for item in items:
+            doc.add_paragraph(item, style="List Bullet")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+def build_xlsx_report(data: ExecutiveSummary) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # Лист 1: KPI
+        df_kpi = pd.DataFrame([
+            {"Показатель": c.label, "Значение": c.value, "Динамика": c.delta}
+            for c in data.key_metrics_cards
+        ])
+        df_kpi.to_excel(writer, sheet_name="KPI_Показатели", index=False)
+
+        # Лист 2: Структура (для диаграмм)
+        if data.structure_breakdown:
+            df_struct = pd.DataFrame([
+                {"Категория": b.category, "Значение": b.amount}
+                for b in data.structure_breakdown
+            ])
+            df_struct.to_excel(writer, sheet_name="Структура", index=False)
+
+        # Лист 3: Динамика по годам
+        if data.chart_series:
+            rows_dyn = []
+            for s in data.chart_series:
+                for p in s.data_points:
+                    rows_dyn.append({"Метрика": s.metric_name, "Период": p.year, "Значение": p.value})
+            if rows_dyn:
+                pd.DataFrame(rows_dyn).to_excel(writer, sheet_name="Динамика", index=False)
+
+        # Лист 4: Текстовые выводы
+        rows_text = [{"Раздел": "AI Smart Insight", "Тезис": data.ai_smart_insight}]
+        for f in data.strategic_findings:
+            rows_text.append({"Раздел": "Стратегия", "Тезис": f})
+        for m in data.marketing_and_clients:
+            rows_text.append({"Раздел": "Маркетинг и клиенты", "Тезис": m})
+        for t in data.tech_and_ai:
+            rows_text.append({"Раздел": "IT и AI", "Тезис": t})
+        for h in data.growth_hypotheses:
+            rows_text.append({"Раздел": "Гипотезы роста", "Тезис": h})
+        pd.DataFrame(rows_text).to_excel(writer, sheet_name="Выводы_и_Гипотезы", index=False)
+
+    return buf.getvalue()
 
 def generate_with_retry(client, model_name, contents, config, status_placeholder, max_retries=3):
     for attempt in range(max_retries):
@@ -204,16 +286,15 @@ def generate_with_retry(client, model_name, contents, config, status_placeholder
             else:
                 raise
 
-def prepare_file_contents(client, uploaded_file, prompt_text, status_placeholder):
+def prepare_single_file_part(client, uploaded_file, label_prefix, status_placeholder):
     file_bytes = uploaded_file.getvalue()
     file_size_mb = len(file_bytes) / (1024 * 1024)
 
     if file_size_mb < 20:
-        status_placeholder.info(f"⏳ Передача PDF ({file_size_mb:.1f} МБ)...")
-        pdf_part = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
-        return [pdf_part, prompt_text]
+        status_placeholder.info(f"⏳ Передача {label_prefix} ({file_size_mb:.1f} МБ)...")
+        return types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
     else:
-        status_placeholder.info(f"⏳ Загрузка файла ({file_size_mb:.1f} МБ) через Files API...")
+        status_placeholder.info(f"⏳ Загрузка {label_prefix} ({file_size_mb:.1f} МБ) через Files API...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
@@ -225,8 +306,8 @@ def prepare_file_contents(client, uploaded_file, prompt_text, status_placeholder
                 attempts += 1
                 uploaded_gemini = client.files.get(name=uploaded_gemini.name)
             if uploaded_gemini.state.name == "FAILED":
-                raise ValueError("Ошибка обработки файла сервером Google.")
-            return [uploaded_gemini, prompt_text]
+                raise ValueError(f"Ошибка обработки {label_prefix} сервером Google.")
+            return uploaded_gemini
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -268,11 +349,11 @@ with tab_agent:
                     tools=active_tools if active_tools else None,
                     temperature=0.2
                 )
-                contents = prepare_file_contents(client, uploaded_file_agent, user_task, status)
+                file_part = prepare_single_file_part(client, uploaded_file_agent, "PDF", status)
                 status.info(f"⏳ Модель `{model_choice}` анализирует документ...")
                 t0 = time.time()
 
-                response = generate_with_retry(client, model_choice, contents, config, status)
+                response = generate_with_retry(client, model_choice, [file_part, user_task], config, status)
                 status.empty()
 
                 st.success(f"Готово за {time.time() - t0:.1f} сек.")
@@ -283,10 +364,10 @@ with tab_agent:
                 st.error(f"Ошибка: {e}")
 
 # ==========================================
-# ВКЛАДКА 2: ДАШБОРД
+# ВКЛАДКА 2: ДАШБОРД И ЭКСПОРТ (DOCX / XLSX / MD)
 # ==========================================
 with tab_dashboard:
-    st.subheader("📊 Аналитический дашборд")
+    st.subheader("📊 Аналитический дашборд и экспорт отчетов")
     uploaded_file_dash = st.file_uploader("Загрузите PDF-документ для визуализации:", type=["pdf"], key="pdf_dash")
 
     if st.button("🚀 Сформировать дашборд", type="primary", key="btn_dash"):
@@ -309,11 +390,11 @@ with tab_dashboard:
                     "главный AI-инсайт и выводы по направлениям. Заполни схему строго по полям."
                 )
 
-                contents = prepare_file_contents(client, uploaded_file_dash, prompt, status)
+                file_part = prepare_single_file_part(client, uploaded_file_dash, "PDF", status)
                 status.info(f"⏳ Модель `{model_choice}` собирает дашборд...")
                 t0 = time.time()
 
-                response = generate_with_retry(client, model_choice, contents, config, status)
+                response = generate_with_retry(client, model_choice, [file_part, prompt], config, status)
                 status.empty()
 
                 data = ExecutiveSummary.model_validate_json(response.text)
@@ -413,6 +494,13 @@ with tab_dashboard:
                     for t in data.tech_and_ai:
                         st.markdown(f"- {t}")
 
+                # --- Блок экспорта в 3 форматах (Word, Excel, Markdown) ---
+                st.markdown("---")
+                st.subheader("📥 Экспорт готового отчета")
+
+                docx_bytes = build_docx_report(data)
+                xlsx_bytes = build_xlsx_report(data)
+
                 report_md = f"# Отчет: {data.company_name} ({data.period})\n\n"
                 report_md += f"> **AI Smart Insight:** {data.ai_smart_insight}\n\n"
                 report_md += "## Ключевые показатели\n"
@@ -423,20 +511,88 @@ with tab_dashboard:
                 report_md += "\n\n## IT и AI\n" + "\n".join([f"- {t}" for t in data.tech_and_ai])
                 report_md += "\n\n## Гипотезы роста\n" + "\n".join([f"- {h}" for h in data.growth_hypotheses])
 
-                st.markdown("---")
-                st.download_button(
-                    label="📥 Скачать готовый отчет (.md)",
-                    data=report_md,
-                    file_name=f"report_{data.company_name}.md",
-                    mime="text/markdown"
-                )
+                dl_col1, dl_col2, dl_col3 = st.columns(3)
+                with dl_col1:
+                    st.download_button(
+                        label="📘 Скачать Word (.docx)",
+                        data=docx_bytes,
+                        file_name=f"Report_{data.company_name}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                with dl_col2:
+                    st.download_button(
+                        label="📗 Скачать Excel (.xlsx)",
+                        data=xlsx_bytes,
+                        file_name=f"Data_{data.company_name}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                with dl_col3:
+                    st.download_button(
+                        label="📄 Скачать Markdown (.md)",
+                        data=report_md,
+                        file_name=f"Report_{data.company_name}.md",
+                        mime="text/markdown"
+                    )
 
             except Exception as e:
                 status.empty()
                 st.error(f"Ошибка: {e}")
 
 # ==========================================
-# ВКЛАДКА 3: ГАЙД И ПОЛЕЗНЫЕ ССЫЛКИ
+# ВКЛАДКА 3: СРАВНЕНИЕ ДВУХ ОТЧЕТОВ (GAP-АНАЛИЗ)
+# ==========================================
+with tab_compare:
+    st.subheader("⚖️ Сравнительный анализ двух документов")
+    st.caption("Загрузите два отчета (например, 2024 vs 2025 год или двух конкурентов) для автоматического сопоставления.")
+
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        doc_1 = st.file_uploader("📄 Документ №1 (Базовый / Конкурент А):", type=["pdf"], key="cmp_doc1")
+    with col_f2:
+        doc_2 = st.file_uploader("📄 Документ №2 (Новый / Конкурент Б):", type=["pdf"], key="cmp_doc2")
+
+    compare_goal = st.text_area(
+        "Критерии сравнения:",
+        value="Проведи глубокий сравнительный анализ двух документов:\n1. Составь сводную таблицу ключевых метрик (Документ 1 vs Документ 2 vs Изменение/Разница).\n2. Выдели 4 главных стратегических сдвига или отличия в бизнес-модели.\n3. Определи сильные и слабые стороны каждого отчета и дай итоговое резюме."
+    )
+
+    if st.button("⚖️ Сравнить документы", type="primary", key="btn_compare"):
+        if not active_api_key:
+            st.error("Укажите API-ключ в левой панели.")
+        elif not doc_1 or not doc_2:
+            st.warning("Загрузите оба PDF-документа для сравнения.")
+        else:
+            status = st.empty()
+            try:
+                client = genai.Client(api_key=active_api_key)
+                config = types.GenerateContentConfig(
+                    tools=[calculate_growth_rate, calculate_ratio],
+                    temperature=0.2
+                )
+                part1 = prepare_single_file_part(client, doc_1, "Документ №1", status)
+                part2 = prepare_single_file_part(client, doc_2, "Документ №2", status)
+
+                prompt_cmp = [
+                    "Первый документ (Базовый):", part1,
+                    "Второй документ (Сравниваемый):", part2,
+                    compare_goal
+                ]
+
+                status.info(f"⏳ Модель `{model_choice}` сопоставляет оба документа и считает дельты...")
+                t0 = time.time()
+
+                response = generate_with_retry(client, model_choice, prompt_cmp, config, status)
+                status.empty()
+
+                st.success(f"Сравнение завершено за {time.time() - t0:.1f} сек.")
+                st.markdown(response.text)
+
+            except Exception as e:
+                status.empty()
+                st.error(f"Ошибка при сравнении: {e}")
+
+# ==========================================
+# ВКЛАДКА 4: ГАЙД И ПОЛЕЗНЫЕ ССЫЛКИ
 # ==========================================
 with tab_guide:
     st.header("📖 Как пользоваться платформой и настроить доступ")
@@ -446,7 +602,7 @@ with tab_guide:
         st.markdown("""
         ### 🆓 1. Бесплатный режим и личный ключ (BYOK)
         * **Базовый режим:** по умолчанию приложение использует легкую модель **`gemini-3.5-flash-lite`**. Она быстро справляется с разбором документов и не требует настроек.
-        * **Зачем нужен свой ключ?** На общем бесплатном тарифе действуют строгие лимиты на число запросов в минуту (RPM) и объем текста (TPM)[cite: 3]. Вставьте свой бесплатный ключ, чтобы снять общие ограничения и открыть доступ к старшим моделям[cite: 3].
+        * **Зачем нужен свой ключ?** На общем бесплатном тарифе действуют строгие лимиты на число запросов в минуту (RPM) и объем текста (TPM). Вставьте свой бесплатный ключ, чтобы снять общие ограничения и открыть доступ к старшим моделям.
         * **Приватность:** ваш API-ключ нигде не сохраняется и живет только внутри текущей сессии браузера.
         """)
 
@@ -472,7 +628,7 @@ with tab_guide:
             "Модель": "gemini-3.8-flash",
             "Доступ": "По личному API-ключу",
             "Особенности": "Высокая скорость, продвинутая логика и работа с инструментами",
-            "Для каких задач": "Сложные многостраничные отчеты, точные расчеты и аналитика"
+            "Для каких задач": "Сложные многостраничные отчеты, сравнение двух документов и точные расчеты"
         },
         {
             "Модель": "gemini-4-argon",
